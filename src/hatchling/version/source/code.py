@@ -9,14 +9,15 @@ class CodeSource(VersionSourceInterface):
     PLUGIN_NAME = 'code'
 
     def get_version_data(self) -> dict:
-        import importlib
         import sys
+        from importlib.util import module_from_spec, spec_from_file_location
 
         relative_path = self.config.get('path')
         if not relative_path:
             message = 'option `path` must be specified'
             raise ValueError(message)
-        elif not isinstance(relative_path, str):
+
+        if not isinstance(relative_path, str):
             message = 'option `path` must be a string'
             raise TypeError(message)
 
@@ -43,21 +44,21 @@ class CodeSource(VersionSourceInterface):
 
             absolute_search_paths.append(os.path.normpath(os.path.join(self.root, search_path)))
 
-        spec = importlib.util.spec_from_file_location(os.path.splitext(path)[0], path)  # type: ignore
-        module = importlib.util.module_from_spec(spec)  # type: ignore
+        spec = spec_from_file_location(os.path.splitext(path)[0], path)
+        module = module_from_spec(spec)  # type: ignore
 
         old_search_paths = list(sys.path)
         try:
             sys.path[:] = [*absolute_search_paths, *old_search_paths]
-            spec.loader.exec_module(module)
+            spec.loader.exec_module(module)  # type: ignore
         finally:
             sys.path[:] = old_search_paths
 
         # Execute the expression to determine the version
-        version = eval(expression, vars(module))
+        version = eval(expression, vars(module))  # noqa: PGH001, S307
 
         return {'version': version}
 
-    def set_version(self, version: str, version_data: dict) -> None:
+    def set_version(self, version: str, version_data: dict) -> None:  # noqa: ARG002, PLR6301
         message = 'Cannot rewrite loaded code'
         raise NotImplementedError(message)

@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Callable, Generator, Generic, Iterable, cast
 
 from hatchling.builders.config import BuilderConfig, BuilderConfigBound, env_var_enabled
-from hatchling.builders.constants import EXCLUDED_DIRECTORIES, BuildEnvVars
+from hatchling.builders.constants import EXCLUDED_DIRECTORIES, EXCLUDED_FILES, BuildEnvVars
 from hatchling.builders.utils import get_relative_path, safe_walk
 from hatchling.plugin.manager import PluginManagerBound
 
@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 
 class IncludedFile:
-    __slots__ = ('path', 'relative_path', 'distribution_path')
+    __slots__ = ('distribution_path', 'path', 'relative_path')
 
     def __init__(self, path: str, relative_path: str, distribution_path: str) -> None:
         self.path = path
@@ -29,29 +29,25 @@ class BuilderInterface(ABC, Generic[BuilderConfigBound, PluginManagerBound]):
     """
     Example usage:
 
-    === ":octicons-file-code-16: plugin.py"
-
-        ```python
-        from hatchling.builders.plugin.interface import BuilderInterface
+    ```python tab="plugin.py"
+    from hatchling.builders.plugin.interface import BuilderInterface
 
 
-        class SpecialBuilder(BuilderInterface):
-            PLUGIN_NAME = 'special'
-            ...
-        ```
+    class SpecialBuilder(BuilderInterface):
+        PLUGIN_NAME = 'special'
+        ...
+    ```
 
-    === ":octicons-file-code-16: hooks.py"
+    ```python tab="hooks.py"
+    from hatchling.plugin import hookimpl
 
-        ```python
-        from hatchling.plugin import hookimpl
-
-        from .plugin import SpecialBuilder
+    from .plugin import SpecialBuilder
 
 
-        @hookimpl
-        def hatch_register_builder():
-            return SpecialBuilder
-        ```
+    @hookimpl
+    def hatch_register_builder():
+        return SpecialBuilder
+    ```
     """
 
     PLUGIN_NAME = ''
@@ -82,12 +78,13 @@ class BuilderInterface(ABC, Generic[BuilderConfigBound, PluginManagerBound]):
 
     def build(
         self,
+        *,
         directory: str | None = None,
         versions: list[str] | None = None,
         hooks_only: bool | None = None,
         clean: bool | None = None,
         clean_hooks_after: bool | None = None,
-        clean_only: bool | None = False,  # noqa: FBT002
+        clean_only: bool | None = False,
     ) -> Generator[str, None, None]:
         # Fail early for invalid project metadata
         self.metadata.validate_fields()
@@ -194,7 +191,14 @@ class BuilderInterface(ABC, Generic[BuilderConfigBound, PluginManagerBound]):
             files.sort()
             is_package = '__init__.py' in files
             for f in files:
+                if f in EXCLUDED_FILES:
+                    continue
+
                 relative_file_path = os.path.join(relative_path, f)
+                distribution_path = self.config.get_distribution_path(relative_file_path)
+                if self.config.path_is_reserved(distribution_path):
+                    continue
+
                 if self.config.include_path(relative_file_path, is_package=is_package):
                     yield IncludedFile(
                         os.path.join(root, f), relative_file_path, self.config.get_distribution_path(relative_file_path)
@@ -217,23 +221,32 @@ class BuilderInterface(ABC, Generic[BuilderConfigBound, PluginManagerBound]):
 
                     files.sort()
                     for f in files:
+                        if f in EXCLUDED_FILES:
+                            continue
+
                         relative_file_path = os.path.join(target_path, relative_directory, f)
-                        if not self.config.path_is_reserved(relative_file_path):
+                        distribution_path = self.config.get_distribution_path(relative_file_path)
+                        if not self.config.path_is_reserved(distribution_path):
                             yield IncludedFile(
                                 os.path.join(root, f),
                                 '' if external else relative_file_path,
-                                self.config.get_distribution_path(relative_file_path),
+                                distribution_path,
                             )
+            else:
+                msg = f'Forced include not found: {source}'
+                raise FileNotFoundError(msg)
 
     def recurse_explicit_files(self, inclusion_map: dict[str, str]) -> Iterable[IncludedFile]:
         for source, target_path in inclusion_map.items():
             external = not source.startswith(self.root)
             if os.path.isfile(source):
-                yield IncludedFile(
-                    source,
-                    '' if external else os.path.relpath(source, self.root),
-                    self.config.get_distribution_path(target_path),
-                )
+                distribution_path = self.config.get_distribution_path(target_path)
+                if not self.config.path_is_reserved(distribution_path):
+                    yield IncludedFile(
+                        source,
+                        '' if external else os.path.relpath(source, self.root),
+                        self.config.get_distribution_path(target_path),
+                    )
             elif os.path.isdir(source):
                 for root, dirs, files in safe_walk(source):
                     relative_directory = get_relative_path(root, source)
@@ -243,12 +256,17 @@ class BuilderInterface(ABC, Generic[BuilderConfigBound, PluginManagerBound]):
                     files.sort()
                     is_package = '__init__.py' in files
                     for f in files:
+                        if f in EXCLUDED_FILES:
+                            continue
+
                         relative_file_path = os.path.join(target_path, relative_directory, f)
+                        distribution_path = self.config.get_distribution_path(relative_file_path)
+                        if self.config.path_is_reserved(distribution_path):
+                            continue
+
                         if self.config.include_path(relative_file_path, explicit=True, is_package=is_package):
                             yield IncludedFile(
-                                os.path.join(root, f),
-                                '' if external else relative_file_path,
-                                self.config.get_distribution_path(relative_file_path),
+                                os.path.join(root, f), '' if external else relative_file_path, distribution_path
                             )
 
     @property
@@ -324,17 +342,9 @@ class BuilderInterface(ABC, Generic[BuilderConfigBound, PluginManagerBound]):
     @property
     def build_config(self) -> dict[str, Any]:
         """
-        === ":octicons-file-code-16: pyproject.toml"
-
-            ```toml
-            [tool.hatch.build]
-            ```
-
-        === ":octicons-file-code-16: hatch.toml"
-
-            ```toml
-            [build]
-            ```
+        ```toml config-example
+        [tool.hatch.build]
+        ```
         """
         if self.__build_config is None:
             self.__build_config = self.metadata.hatch.build_config
@@ -344,17 +354,9 @@ class BuilderInterface(ABC, Generic[BuilderConfigBound, PluginManagerBound]):
     @property
     def target_config(self) -> dict[str, Any]:
         """
-        === ":octicons-file-code-16: pyproject.toml"
-
-            ```toml
-            [tool.hatch.build.targets.<PLUGIN_NAME>]
-            ```
-
-        === ":octicons-file-code-16: hatch.toml"
-
-            ```toml
-            [build.targets.<PLUGIN_NAME>]
-            ```
+        ```toml config-example
+        [tool.hatch.build.targets.<PLUGIN_NAME>]
+        ```
         """
         if self.__target_config is None:
             target_config: dict[str, Any] = self.metadata.hatch.build_targets.get(self.PLUGIN_NAME, {})
@@ -408,13 +410,13 @@ class BuilderInterface(ABC, Generic[BuilderConfigBound, PluginManagerBound]):
         """
         return list(self.get_version_api())
 
-    def get_default_build_data(self) -> dict[str, Any]:
+    def get_default_build_data(self) -> dict[str, Any]:  # noqa: PLR6301
         """
         A mapping that can be modified by [build hooks](../build-hook/reference.md) to influence the behavior of builds.
         """
         return {}
 
-    def set_build_data_defaults(self, build_data: dict[str, Any]) -> None:
+    def set_build_data_defaults(self, build_data: dict[str, Any]) -> None:  # noqa: PLR6301
         build_data.setdefault('artifacts', [])
         build_data.setdefault('force_include', {})
 
@@ -436,4 +438,4 @@ class BuilderInterface(ABC, Generic[BuilderConfigBound, PluginManagerBound]):
         """
         https://peps.python.org/pep-0427/#escaping-and-unicode
         """
-        return re.sub(r'[^\w\d.]+', '_', file_name, re.UNICODE)
+        return re.sub(r'[^\w\d.]+', '_', file_name, flags=re.UNICODE)

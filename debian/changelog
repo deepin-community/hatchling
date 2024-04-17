@@ -1,3 +1,16 @@
+hatchling (1.22.4-1) unstable; urgency=medium
+
+  * New upstream release.
+  * Bump copyright years.
+
+ -- Stefano Rivera <stefanor@debian.org>  Sun, 24 Mar 2024 16:09:46 -0400
+
+hatchling (1.21.0-1) unstable; urgency=medium
+
+  * New upstream release.
+
+ -- Stefano Rivera <stefanor@debian.org>  Wed, 20 Dec 2023 17:08:12 -0400
+
 hatchling (1.18.0-1) unstable; urgency=medium
 
   * New upstream release.
