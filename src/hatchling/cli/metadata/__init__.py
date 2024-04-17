@@ -4,16 +4,21 @@ import argparse
 from typing import Any
 
 
-def metadata_impl(*, called_by_app: bool, field: str, compact: bool) -> None:
+def metadata_impl(
+    *,
+    called_by_app: bool,  # noqa: ARG001
+    field: str,
+    compact: bool,
+) -> None:
     import json
     import os
 
-    from hatchling.bridge.app import get_application
+    from hatchling.bridge.app import Application
     from hatchling.metadata.core import ProjectMetadata
     from hatchling.metadata.utils import resolve_metadata_fields
     from hatchling.plugin.manager import PluginManager
 
-    app = get_application(called_by_app=called_by_app)
+    app = Application()
 
     root = os.getcwd()
     plugin_manager = PluginManager()
@@ -42,7 +47,10 @@ def metadata_impl(*, called_by_app: bool, field: str, compact: bool) -> None:
         app.display(json.dumps(metadata, indent=4))
 
 
-def metadata_command(subparsers: argparse._SubParsersAction, defaults: Any) -> None:
+def metadata_command(
+    subparsers: argparse._SubParsersAction,
+    defaults: Any,  # noqa: ARG001
+) -> None:
     parser = subparsers.add_parser('metadata')
     parser.add_argument('field', nargs='?')
     parser.add_argument('-c', '--compact', action='store_true')

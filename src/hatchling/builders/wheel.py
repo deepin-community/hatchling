@@ -4,13 +4,16 @@ import csv
 import hashlib
 import os
 import stat
+import sys
 import tempfile
 import zipfile
+from functools import cached_property
 from io import StringIO
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Sequence, Tuple, cast
+from typing import TYPE_CHECKING, Any, Callable, Iterable, NamedTuple, Sequence, Tuple, cast
 
 from hatchling.__about__ import __version__
 from hatchling.builders.config import BuilderConfig
+from hatchling.builders.constants import EDITABLES_REQUIREMENT
 from hatchling.builders.plugin.interface import BuilderInterface
 from hatchling.builders.utils import (
     format_file_hash,
@@ -30,9 +33,14 @@ if TYPE_CHECKING:
     from hatchling.builders.plugin.interface import IncludedFile
 
 
-EDITABLES_MINIMUM_VERSION = '0.3'
-
 TIME_TUPLE = Tuple[int, int, int, int, int, int]
+
+
+class FileSelectionOptions(NamedTuple):
+    include: list[str]
+    exclude: list[str]
+    packages: list[str]
+    only_include: list[str]
 
 
 class RecordFile:
@@ -46,7 +54,7 @@ class RecordFile:
     def construct(self) -> str:
         return self.__file_obj.getvalue()
 
-    def __enter__(self) -> RecordFile:
+    def __enter__(self) -> RecordFile:  # noqa: PYI034
         return self
 
     def __exit__(
@@ -139,7 +147,7 @@ class WheelArchive:
 
         return relative_path, f'sha256={hash_digest}', str(len(contents))
 
-    def __enter__(self) -> WheelArchive:
+    def __enter__(self) -> WheelArchive:  # noqa: PYI034
         return self
 
     def __exit__(
@@ -153,75 +161,78 @@ class WheelBuilderConfig(BuilderConfig):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
 
-        self.__include_defined: bool = bool(
-            self.target_config.get('include', self.build_config.get('include'))
-            or self.target_config.get('packages', self.build_config.get('packages'))
-            or self.target_config.get('only-include', self.build_config.get('only-include'))
-        )
-        self.__include: list[str] = []
-        self.__exclude: list[str] = []
-        self.__packages: list[str] = []
-        self.__only_include: list[str] = []
-
         self.__core_metadata_constructor: Callable[..., str] | None = None
         self.__shared_data: dict[str, str] | None = None
         self.__extra_metadata: dict[str, str] | None = None
         self.__strict_naming: bool | None = None
         self.__macos_max_compat: bool | None = None
 
-    def set_default_file_selection(self) -> None:
-        if self.__include or self.__exclude or self.__packages or self.__only_include:
-            return
+    @cached_property
+    def default_file_selection_options(self) -> FileSelectionOptions:
+        include = self.target_config.get('include', self.build_config.get('include', []))
+        exclude = self.target_config.get('exclude', self.build_config.get('exclude', []))
+        packages = self.target_config.get('packages', self.build_config.get('packages', []))
+        only_include = self.target_config.get('only-include', self.build_config.get('only-include', []))
 
+        if include or packages or only_include:
+            return FileSelectionOptions(include, exclude, packages, only_include)
+
+        project_names: set[str] = set()
         for project_name in (
             self.builder.normalize_file_name_component(self.builder.metadata.core.raw_name),
             self.builder.normalize_file_name_component(self.builder.metadata.core.name),
         ):
             if os.path.isfile(os.path.join(self.root, project_name, '__init__.py')):
-                self.__packages.append(project_name)
-                break
-            elif os.path.isfile(os.path.join(self.root, 'src', project_name, '__init__.py')):
-                self.__packages.append(f'src/{project_name}')
-                break
-            elif os.path.isfile(os.path.join(self.root, f'{project_name}.py')):
-                self.__only_include.append(f'{project_name}.py')
-                break
-            else:
-                from glob import glob
+                normalized_project_name = self.get_raw_fs_path_name(self.root, project_name)
+                return FileSelectionOptions([], exclude, [normalized_project_name], [])
 
-                possible_namespace_packages = glob(os.path.join(self.root, '*', project_name, '__init__.py'))
-                if len(possible_namespace_packages) == 1:
-                    relative_path = os.path.relpath(possible_namespace_packages[0], self.root)
-                    namespace = relative_path.split(os.sep)[0]
-                    self.__packages.append(namespace)
-                    break
-        else:
-            self.__include.append('*.py')
-            self.__exclude.append('test*')
+            if os.path.isfile(os.path.join(self.root, 'src', project_name, '__init__.py')):
+                normalized_project_name = self.get_raw_fs_path_name(os.path.join(self.root, 'src'), project_name)
+                return FileSelectionOptions([], exclude, [f'src/{normalized_project_name}'], [])
+
+            module_file = f'{project_name}.py'
+            if os.path.isfile(os.path.join(self.root, module_file)):
+                return FileSelectionOptions([], exclude, [], [module_file])
+
+            from glob import glob
+
+            possible_namespace_packages = glob(os.path.join(self.root, '*', project_name, '__init__.py'))
+            if len(possible_namespace_packages) == 1:
+                relative_path = os.path.relpath(possible_namespace_packages[0], self.root)
+                namespace = relative_path.split(os.sep)[0]
+                return FileSelectionOptions([], exclude, [namespace], [])
+            project_names.add(project_name)
+
+        if self.bypass_selection or self.build_artifact_spec is not None or self.get_force_include():
+            self.set_exclude_all()
+            return FileSelectionOptions([], exclude, [], [])
+
+        project_names_text = ' or '.join(sorted(project_names))
+        message = (
+            f'Unable to determine which files to ship inside the wheel using the following heuristics: '
+            f'https://hatch.pypa.io/latest/plugins/builder/wheel/#default-file-selection\n\n'
+            f'The most likely cause of this is that there is no directory that matches the name of your '
+            f'project ({project_names_text}).\n\n'
+            f'At least one file selection option must be defined in the `tool.hatch.build.targets.wheel` '
+            f'table, see: https://hatch.pypa.io/latest/config/build/\n\n'
+            f'As an example, if you intend to ship a directory named `foo` that resides within a `src` '
+            f'directory located at the root of your project, you can define the following:\n\n'
+            f'[tool.hatch.build.targets.wheel]\n'
+            f'packages = ["src/foo"]'
+        )
+        raise ValueError(message)
 
     def default_include(self) -> list[str]:
-        if not self.__include_defined:
-            self.set_default_file_selection()
-
-        return self.__include
+        return self.default_file_selection_options.include
 
     def default_exclude(self) -> list[str]:
-        if not self.__include_defined:
-            self.set_default_file_selection()
-
-        return self.__exclude
+        return self.default_file_selection_options.exclude
 
     def default_packages(self) -> list[str]:
-        if not self.__include_defined:
-            self.set_default_file_selection()
-
-        return self.__packages
+        return self.default_file_selection_options.packages
 
     def default_only_include(self) -> list[str]:
-        if not self.__include_defined:
-            self.set_default_file_selection()
-
-        return self.__only_include
+        return self.default_file_selection_options.only_include
 
     @property
     def core_metadata_constructor(self) -> Callable[..., str]:
@@ -259,13 +270,15 @@ class WheelBuilderConfig(BuilderConfig):
                         f'cannot be an empty string'
                     )
                     raise ValueError(message)
-                elif not isinstance(relative_path, str):
+
+                if not isinstance(relative_path, str):
                     message = (
                         f'Path for source `{source}` in field '
                         f'`tool.hatch.build.targets.{self.plugin_name}.shared-data` must be a string'
                     )
                     raise TypeError(message)
-                elif not relative_path:
+
+                if not relative_path:
                     message = (
                         f'Path for source `{source}` in field '
                         f'`tool.hatch.build.targets.{self.plugin_name}.shared-data` cannot be an empty string'
@@ -291,13 +304,15 @@ class WheelBuilderConfig(BuilderConfig):
                         f'cannot be an empty string'
                     )
                     raise ValueError(message)
-                elif not isinstance(relative_path, str):
+
+                if not isinstance(relative_path, str):
                     message = (
                         f'Path for source `{source}` in field '
                         f'`tool.hatch.build.targets.{self.plugin_name}.extra-metadata` must be a string'
                     )
                     raise TypeError(message)
-                elif not relative_path:
+
+                if not relative_path:
                     message = (
                         f'Path for source `{source}` in field '
                         f'`tool.hatch.build.targets.{self.plugin_name}.extra-metadata` cannot be an empty string'
@@ -338,6 +353,33 @@ class WheelBuilderConfig(BuilderConfig):
 
         return self.__macos_max_compat
 
+    @cached_property
+    def bypass_selection(self) -> bool:
+        bypass_selection = self.target_config.get('bypass-selection', False)
+        if not isinstance(bypass_selection, bool):
+            message = f'Field `tool.hatch.build.targets.{self.plugin_name}.bypass-selection` must be a boolean'
+            raise TypeError(message)
+
+        return bypass_selection
+
+    if sys.platform in {'darwin', 'win32'}:
+
+        @staticmethod
+        def get_raw_fs_path_name(directory: str, name: str) -> str:
+            normalized = name.casefold()
+            entries = os.listdir(directory)
+            for entry in entries:
+                if entry.casefold() == normalized:
+                    return entry
+
+            return name  # no cov
+
+    else:
+
+        @staticmethod
+        def get_raw_fs_path_name(directory: str, name: str) -> str:  # noqa: ARG004
+            return name
+
 
 class WheelBuilder(BuilderInterface):
     """
@@ -349,10 +391,14 @@ class WheelBuilder(BuilderInterface):
     def get_version_api(self) -> dict[str, Callable]:
         return {'standard': self.build_standard, 'editable': self.build_editable}
 
-    def get_default_versions(self) -> list[str]:
+    def get_default_versions(self) -> list[str]:  # noqa: PLR6301
         return ['standard']
 
-    def clean(self, directory: str, versions: list[str]) -> None:
+    def clean(  # noqa: PLR6301
+        self,
+        directory: str,
+        versions: list[str],  # noqa: ARG002
+    ) -> None:
         for filename in os.listdir(directory):
             if filename.endswith('.whl'):
                 os.remove(os.path.join(directory, filename))
@@ -384,8 +430,8 @@ class WheelBuilder(BuilderInterface):
     def build_editable(self, directory: str, **build_data: Any) -> str:
         if self.config.dev_mode_dirs:
             return self.build_editable_explicit(directory, **build_data)
-        else:
-            return self.build_editable_detection(directory, **build_data)
+
+        return self.build_editable_detection(directory, **build_data)
 
     def build_editable_detection(self, directory: str, **build_data: Any) -> str:
         from editables import EditableProject
@@ -418,7 +464,7 @@ class WheelBuilder(BuilderInterface):
                     try:
                         exposed_packages[distribution_module] = os.path.join(
                             self.root,
-                            f'{relative_path[:relative_path.index(distribution_path)]}{distribution_module}',
+                            f'{relative_path[: relative_path.index(distribution_path)]}{distribution_module}',
                         )
                     except ValueError:
                         message = (
@@ -437,7 +483,8 @@ class WheelBuilder(BuilderInterface):
                 for relative_path in exposed_packages.values():
                     editable_project.add_to_path(os.path.dirname(relative_path))
 
-            for filename, content in sorted(editable_project.files()):
+            for raw_filename, content in sorted(editable_project.files()):
+                filename = raw_filename
                 if filename.endswith('.pth') and not filename.startswith('_'):
                     filename = f'_{filename}'
 
@@ -449,9 +496,10 @@ class WheelBuilder(BuilderInterface):
                 records.write(record)
 
             extra_dependencies = list(build_data['dependencies'])
-            for dependency in editable_project.dependencies():
+            for raw_dependency in editable_project.dependencies():
+                dependency = raw_dependency
                 if dependency == 'editables':
-                    dependency += f'~={EDITABLES_MINIMUM_VERSION}'
+                    dependency = EDITABLES_REQUIREMENT
                 else:  # no cov
                     pass
 
@@ -533,7 +581,8 @@ class WheelBuilder(BuilderInterface):
         # extra_metadata/ - write last
         self.add_extra_metadata(archive, records, build_data)
 
-    def write_archive_metadata(self, archive: WheelArchive, records: RecordFile, build_data: dict[str, Any]) -> None:
+    @staticmethod
+    def write_archive_metadata(archive: WheelArchive, records: RecordFile, build_data: dict[str, Any]) -> None:
         from packaging.tags import parse_tag
 
         metadata = f"""\
@@ -600,11 +649,28 @@ Root-Is-Purelib: {'true' if build_data['pure_python'] else 'false'}
         return metadata_file.lstrip()
 
     def get_default_tag(self) -> str:
+        known_major_versions = list(get_known_python_major_versions())
+        max_version_part = 100
         supported_python_versions = []
-        for major_version in get_known_python_major_versions():
-            for minor_version in range(100):
-                if self.metadata.core.python_constraint.contains(f'{major_version}.{minor_version}'):
+        for major_version in known_major_versions:
+            for minor_version in range(max_version_part):
+                # Try an artificially high patch version to account for common cases like `>=3.11.4` or `>=3.10,<3.11`
+                if self.metadata.core.python_constraint.contains(f'{major_version}.{minor_version}.{max_version_part}'):
                     supported_python_versions.append(f'py{major_version}')
+                    break
+
+        # Slow path, try all permutations to account for narrow support ranges like `<=3.11.4`
+        if not supported_python_versions:
+            for major_version in known_major_versions:
+                for minor_version in range(max_version_part):
+                    for patch_version in range(max_version_part):
+                        if self.metadata.core.python_constraint.contains(
+                            f'{major_version}.{minor_version}.{patch_version}'
+                        ):
+                            supported_python_versions.append(f'py{major_version}')
+                            break
+                    else:
+                        continue
                     break
 
         return f'{".".join(supported_python_versions)}-none-any'
@@ -628,7 +694,7 @@ Root-Is-Purelib: {'true' if build_data['pure_python'] else 'false'}
                     plat = tag_parts[2]
                     current_arch = platform.mac_ver()[2]
                     new_arch = 'universal2' if set(archs) == {'x86_64', 'arm64'} else archs[0]
-                    tag_parts[2] = f'{plat[:plat.rfind(current_arch)]}{new_arch}'
+                    tag_parts[2] = f'{plat[: plat.rfind(current_arch)]}{new_arch}'
 
             if self.config.macos_max_compat:
                 import re
@@ -642,7 +708,7 @@ Root-Is-Purelib: {'true' if build_data['pure_python'] else 'false'}
 
         return '-'.join(tag_parts)
 
-    def get_default_build_data(self) -> dict[str, Any]:
+    def get_default_build_data(self) -> dict[str, Any]:  # noqa: PLR6301
         return {
             'infer_tag': False,
             'pure_python': True,
