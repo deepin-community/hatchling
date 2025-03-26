@@ -1,6 +1,6 @@
-Metadata-Version: 2.3
+Metadata-Version: 2.4
 Name: hatchling
-Version: 1.22.4
+Version: 1.27.0
 Summary: Modern, extensible Python build backend
 Project-URL: Homepage, https://hatch.pypa.io/latest/
 Project-URL: Sponsor, https://github.com/sponsors/ofek
@@ -26,7 +26,7 @@ Classifier: Programming Language :: Python :: Implementation :: PyPy
 Classifier: Topic :: Software Development :: Build Tools
 Classifier: Topic :: Software Development :: Libraries :: Python Modules
 Requires-Python: >=3.8
-Requires-Dist: packaging>=21.3
+Requires-Dist: packaging>=24.2
 Requires-Dist: pathspec>=0.10.1
 Requires-Dist: pluggy>=1.0.0
 Requires-Dist: tomli>=1.2.2; python_version < '3.11'
