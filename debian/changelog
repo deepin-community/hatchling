@@ -1,3 +1,30 @@
+hatchling (1.27.0-1) unstable; urgency=medium
+
+  * New upstream release.
+  * Bump Standards-Version to 4.7.0, no changes needed.
+
+ -- Stefano Rivera <stefanor@debian.org>  Sat, 21 Dec 2024 11:14:19 -0400
+
+hatchling (1.26.3-1) unstable; urgency=medium
+
+  * New upstream release.
+  * Bump python3-packaging Build-Depends.
+
+ -- Stefano Rivera <stefanor@debian.org>  Sun, 17 Nov 2024 10:21:18 +0100
+
+hatchling (1.25.0-1) unstable; urgency=medium
+
+  * New upstream release.
+
+ -- Stefano Rivera <stefanor@debian.org>  Wed, 26 Jun 2024 21:18:20 -0700
+
+hatchling (1.24.2-1) unstable; urgency=medium
+
+  * New upstream release.
+  * Build-Depend on python3-packaging.
+
+ -- Stefano Rivera <stefanor@debian.org>  Mon, 22 Apr 2024 18:00:24 -0400
+
 hatchling (1.22.4-1) unstable; urgency=medium
 
   * New upstream release.

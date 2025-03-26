@@ -3,6 +3,8 @@ DEFAULT_BUILD_DIRECTORY = 'dist'
 EXCLUDED_DIRECTORIES = frozenset((
     # Python bytecode
     '__pycache__',
+    # Single virtual environment
+    '.venv',
     # Git
     '.git',
     # Mercurial
@@ -19,6 +21,8 @@ EXCLUDED_DIRECTORIES = frozenset((
     '.pytest_cache',
     # Mypy
     '.mypy_cache',
+    # pixi
+    '.pixi',
 ))
 EXCLUDED_FILES = frozenset((
     # https://en.wikipedia.org/wiki/.DS_Store

@@ -6,7 +6,12 @@ from contextlib import suppress
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, Generic, cast
 
-from hatchling.metadata.utils import get_normalized_dependency, is_valid_project_name, normalize_project_name
+from hatchling.metadata.utils import (
+    format_dependency,
+    is_valid_project_name,
+    normalize_project_name,
+    normalize_requirement,
+)
 from hatchling.plugin.manager import PluginManagerBound
 from hatchling.utils.constants import DEFAULT_CONFIG_FILE
 from hatchling.utils.fs import locate_file
@@ -87,16 +92,17 @@ class ProjectMetadata(Generic[PluginManagerBound]):
             core_raw_metadata = deepcopy(core_raw_metadata)
             pkg_info = os.path.join(self.root, 'PKG-INFO')
             if os.path.isfile(pkg_info):
-                from hatchling.metadata.spec import project_metadata_from_core_metadata
+                from hatchling.metadata.spec import PROJECT_CORE_METADATA_FIELDS, project_metadata_from_core_metadata
 
                 with open(pkg_info, encoding='utf-8') as f:
                     pkg_info_contents = f.read()
 
                 base_metadata = project_metadata_from_core_metadata(pkg_info_contents)
-                defined_dynamic = core_raw_metadata.pop('dynamic', [])
-                for field in defined_dynamic:
-                    if field in base_metadata:
+                defined_dynamic = core_raw_metadata.get('dynamic', [])
+                for field in list(defined_dynamic):
+                    if field in PROJECT_CORE_METADATA_FIELDS and field in base_metadata:
                         core_raw_metadata[field] = base_metadata[field]
+                        defined_dynamic.remove(field)
 
             self._core_raw_metadata = core_raw_metadata
 
@@ -668,10 +674,10 @@ class CoreMetadata:
                 self._license = ''
                 self._license_expression = ''
             elif isinstance(data, str):
-                from hatchling.licenses.parse import normalize_license_expression
+                from packaging.licenses import canonicalize_license_expression
 
                 try:
-                    self._license_expression = normalize_license_expression(data)
+                    self._license_expression = str(canonicalize_license_expression(data))
                 except ValueError as e:
                     message = f'Error parsing field `project.license` - {e}'
                     raise ValueError(message) from None
@@ -728,9 +734,8 @@ class CoreMetadata:
         https://peps.python.org/pep-0639/
         """
         if self._license_files is None:
-            if 'license-files' not in self.config:
-                data = {'globs': ['LICEN[CS]E*', 'COPYING*', 'NOTICE*', 'AUTHORS*']}
-            else:
+            if 'license-files' in self.config:
+                globs = self.config['license-files']
                 if 'license-files' in self.dynamic:
                     message = (
                         'Metadata field `license-files` cannot be both statically defined and '
@@ -738,55 +743,29 @@ class CoreMetadata:
                     )
                     raise ValueError(message)
 
-                data = self.config['license-files']
-                if not isinstance(data, dict):
-                    message = 'Field `project.license-files` must be a table'
-                    raise TypeError(message)
-
-                if 'paths' in data and 'globs' in data:
-                    message = 'Cannot specify both `paths` and `globs` in the `project.license-files` table'
-                    raise ValueError(message)
-
-            license_files = []
-            if 'paths' in data:
-                paths = data['paths']
-                if not isinstance(paths, list):
-                    message = 'Field `paths` in the `project.license-files` table must be an array'
-                    raise TypeError(message)
-
-                for i, relative_path in enumerate(paths, 1):
-                    if not isinstance(relative_path, str):
-                        message = f'Entry #{i} in field `paths` in the `project.license-files` table must be a string'
-                        raise TypeError(message)
-
-                    path = os.path.normpath(os.path.join(self.root, relative_path))
-                    if not os.path.isfile(path):
-                        message = f'License file does not exist: {relative_path}'
-                        raise OSError(message)
-
-                    license_files.append(os.path.relpath(path, self.root).replace('\\', '/'))
-            elif 'globs' in data:
-                from glob import glob
-
-                globs = data['globs']
-                if not isinstance(globs, list):
-                    message = 'Field `globs` in the `project.license-files` table must be an array'
-                    raise TypeError(message)
-
-                for i, pattern in enumerate(globs, 1):
-                    if not isinstance(pattern, str):
-                        message = f'Entry #{i} in field `globs` in the `project.license-files` table must be a string'
-                        raise TypeError(message)
-
-                    full_pattern = os.path.normpath(os.path.join(self.root, pattern))
-                    license_files.extend(
-                        os.path.relpath(path, self.root).replace('\\', '/')
-                        for path in glob(full_pattern)
-                        if os.path.isfile(path)
-                    )
+                if isinstance(globs, dict):
+                    globs = globs.get('globs', globs.get('paths', []))
             else:
-                message = 'Must specify either `paths` or `globs` in the `project.license-files` table if defined'
-                raise ValueError(message)
+                globs = ['LICEN[CS]E*', 'COPYING*', 'NOTICE*', 'AUTHORS*']
+
+            from glob import glob
+
+            license_files: list[str] = []
+            if not isinstance(globs, list):
+                message = 'Field `project.license-files` must be an array'
+                raise TypeError(message)
+
+            for i, pattern in enumerate(globs, 1):
+                if not isinstance(pattern, str):
+                    message = f'Entry #{i} of field `project.license-files` must be a string'
+                    raise TypeError(message)
+
+                full_pattern = os.path.normpath(os.path.join(self.root, pattern))
+                license_files.extend(
+                    os.path.relpath(path, self.root).replace('\\', '/')
+                    for path in glob(full_pattern)
+                    if os.path.isfile(path)
+                )
 
             self._license_files = sorted(license_files)
 
@@ -971,8 +950,6 @@ class CoreMetadata:
         if self._classifiers is None:
             import bisect
 
-            import trove_classifiers
-
             if 'classifiers' in self.config:
                 classifiers = self.config['classifiers']
                 if 'classifiers' in self.dynamic:
@@ -988,7 +965,16 @@ class CoreMetadata:
                 message = 'Field `project.classifiers` must be an array'
                 raise TypeError(message)
 
-            known_classifiers = trove_classifiers.classifiers | self._extra_classifiers
+            verify_classifiers = not os.environ.get('HATCH_METADATA_CLASSIFIERS_NO_VERIFY')
+            if verify_classifiers:
+                import trove_classifiers
+
+                known_classifiers = trove_classifiers.classifiers | self._extra_classifiers
+                sorted_classifiers = list(trove_classifiers.sorted_classifiers)
+
+                for classifier in sorted(self._extra_classifiers - trove_classifiers.classifiers):
+                    bisect.insort(sorted_classifiers, classifier)
+
             unique_classifiers = set()
 
             for i, classifier in enumerate(classifiers, 1):
@@ -996,15 +982,25 @@ class CoreMetadata:
                     message = f'Classifier #{i} of field `project.classifiers` must be a string'
                     raise TypeError(message)
 
-                if not self.__classifier_is_private(classifier) and classifier not in known_classifiers:
+                if (
+                    not self.__classifier_is_private(classifier)
+                    and verify_classifiers
+                    and classifier not in known_classifiers
+                ):
                     message = f'Unknown classifier in field `project.classifiers`: {classifier}'
                     raise ValueError(message)
 
                 unique_classifiers.add(classifier)
 
-            sorted_classifiers = list(trove_classifiers.sorted_classifiers)
-            for classifier in sorted(self._extra_classifiers - trove_classifiers.classifiers):
-                bisect.insort(sorted_classifiers, classifier)
+            if not verify_classifiers:
+                import re
+
+                # combined text-numeric sort that ensures that Python versions sort correctly
+                split_re = re.compile(r'(\D*)(\d*)')
+                sorted_classifiers = sorted(
+                    classifiers,
+                    key=lambda value: ([(a, int(b) if b else None) for a, b in split_re.findall(value)]),
+                )
 
             self._classifiers = sorted(
                 unique_classifiers, key=lambda c: -1 if self.__classifier_is_private(c) else sorted_classifiers.index(c)
@@ -1208,7 +1204,8 @@ class CoreMetadata:
                         )
                         raise ValueError(message)
 
-                    dependencies_complex[get_normalized_dependency(requirement)] = requirement
+                    normalize_requirement(requirement)
+                    dependencies_complex[format_dependency(requirement)] = requirement
 
             self._dependencies_complex = dict(sorted(dependencies_complex.items()))
 
@@ -1249,6 +1246,7 @@ class CoreMetadata:
 
             normalized_options: dict[str, str] = {}
             optional_dependency_entries = {}
+            inherited_options: dict[str, set[str]] = {}
 
             for option, dependencies in optional_dependencies.items():
                 if not is_valid_project_name(option):
@@ -1256,6 +1254,16 @@ class CoreMetadata:
                         f'Optional dependency group `{option}` of field `project.optional-dependencies` must only '
                         f'contain ASCII letters/digits, underscores, hyphens, and periods, and must begin and end with '
                         f'ASCII letters/digits.'
+                    )
+                    raise ValueError(message)
+
+                normalized_option = (
+                    option if self.hatch_metadata.allow_ambiguous_features else normalize_project_name(option)
+                )
+                if normalized_option in normalized_options:
+                    message = (
+                        f'Optional dependency groups `{normalized_options[normalized_option]}` and `{option}` of '
+                        f'field `project.optional-dependencies` both evaluate to `{normalized_option}`.'
                     )
                     raise ValueError(message)
 
@@ -1292,22 +1300,28 @@ class CoreMetadata:
                             )
                             raise ValueError(message)
 
-                        entries[get_normalized_dependency(requirement)] = requirement
-
-                normalized_option = (
-                    option if self.hatch_metadata.allow_ambiguous_features else normalize_project_name(option)
-                )
-                if normalized_option in normalized_options:
-                    message = (
-                        f'Optional dependency groups `{normalized_options[normalized_option]}` and `{option}` of '
-                        f'field `project.optional-dependencies` both evaluate to `{normalized_option}`.'
-                    )
-                    raise ValueError(message)
+                        normalize_requirement(requirement)
+                        if requirement.name == self.name:
+                            if normalized_option in inherited_options:
+                                inherited_options[normalized_option].update(requirement.extras)
+                            else:
+                                inherited_options[normalized_option] = set(requirement.extras)
+                        else:
+                            entries[format_dependency(requirement)] = requirement
 
                 normalized_options[normalized_option] = option
-                optional_dependency_entries[normalized_option] = dict(sorted(entries.items()))
+                optional_dependency_entries[normalized_option] = entries
 
-            self._optional_dependencies_complex = dict(sorted(optional_dependency_entries.items()))
+            visited: set[str] = set()
+            resolved: set[str] = set()
+            for dependent_option in inherited_options:
+                _resolve_optional_dependencies(
+                    optional_dependency_entries, dependent_option, inherited_options, visited, resolved
+                )
+
+            self._optional_dependencies_complex = {
+                option: dict(sorted(entries.items())) for option, entries in sorted(optional_dependency_entries.items())
+            }
 
         return self._optional_dependencies_complex
 
@@ -1577,3 +1591,31 @@ class HatchMetadataSettings(Generic[PluginManagerBound]):
             self._hooks = configured_hooks
 
         return self._hooks
+
+
+def _resolve_optional_dependencies(
+    optional_dependencies_complex, dependent_option, inherited_options, visited, resolved
+):
+    if dependent_option in resolved:
+        return
+
+    if dependent_option in visited:
+        message = f'Field `project.optional-dependencies` defines a circular dependency group: {dependent_option}'
+        raise ValueError(message)
+
+    visited.add(dependent_option)
+    if dependent_option in inherited_options:
+        for selected_option in inherited_options[dependent_option]:
+            _resolve_optional_dependencies(
+                optional_dependencies_complex, selected_option, inherited_options, visited, resolved
+            )
+            if selected_option not in optional_dependencies_complex:
+                message = (
+                    f'Unknown recursive dependency group in field `project.optional-dependencies`: {selected_option}'
+                )
+                raise ValueError(message)
+
+            optional_dependencies_complex[dependent_option].update(optional_dependencies_complex[selected_option])
+
+    resolved.add(dependent_option)
+    visited.remove(dependent_option)
